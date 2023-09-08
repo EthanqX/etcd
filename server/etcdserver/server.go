@@ -299,6 +299,9 @@ type EtcdServer struct {
 	// Should only be set within apply code path. Used to force snapshot after cluster version downgrade.
 	forceSnapshot     bool
 	corruptionChecker CorruptionChecker
+
+	//@ethan
+	WriteScroogeC chan []byte
 }
 
 // NewServer creates a new EtcdServer from the supplied configuration. The
@@ -340,6 +343,9 @@ func NewServer(cfg config.ServerConfig) (srv *EtcdServer, err error) {
 		consistIndex:          b.storage.backend.ci,
 		firstCommitInTerm:     notify.NewNotifier(),
 		clusterVersionChanged: notify.NewNotifier(),
+
+		//@ethan
+		WriteScroogeC: make(chan []byte, 100),
 	}
 	serverID.With(prometheus.Labels{"server_id": b.cluster.nodeID.String()}).Set(1)
 	srv.cluster.SetVersionChangedNotifier(srv.clusterVersionChanged)
@@ -591,6 +597,11 @@ func (s *EtcdServer) start() {
 	// TODO: if this is an empty log, writes all peer infos
 	// into the first entry
 	go s.run()
+
+	//@ethan Continuously reads from and writes to Scrooge
+	// s.CreatePipe()
+	go s.ReadScrooge()
+	go s.WriteScrooge()
 }
 
 func (s *EtcdServer) purgeFile() {
@@ -806,6 +817,7 @@ func (s *EtcdServer) run() {
 			}
 		},
 	}
+
 	s.r.start(rh)
 
 	ep := etcdProgress{
@@ -834,6 +846,9 @@ func (s *EtcdServer) run() {
 		s.Cleanup()
 
 		close(s.done)
+
+		//@ethan closes channel for writing to Scrooge
+		close(s.WriteScroogeC)
 	}()
 
 	var expiredLeaseC <-chan []*lease.Lease
@@ -1133,7 +1148,7 @@ func (s *EtcdServer) applyEntries(ep *etcdProgress, apply *toApply) {
 		return
 	}
 	var shouldstop bool
-	if ep.appliedt, ep.appliedi, shouldstop = s.apply(ents, &ep.confState, apply.raftAdvancedC); shouldstop {
+	if ep.appliedt, ep.appliedi, shouldstop = s.apply(ents, &ep.confState); shouldstop {
 		go s.stopWithDelay(10*100*time.Millisecond, fmt.Errorf("the member has been permanently removed from the cluster"))
 	}
 }
@@ -1649,9 +1664,8 @@ func (s *EtcdServer) AppliedIndex() uint64 { return s.getAppliedIndex() }
 func (s *EtcdServer) Term() uint64 { return s.getTerm() }
 
 type confChangeResponse struct {
-	membs        []*membership.Member
-	raftAdvanceC <-chan struct{}
-	err          error
+	membs []*membership.Member
+	err   error
 }
 
 // configure sends a configuration change through consensus and
@@ -1674,11 +1688,6 @@ func (s *EtcdServer) configure(ctx context.Context, cc raftpb.ConfChange) ([]*me
 			lg.Panic("failed to configure")
 		}
 		resp := x.(*confChangeResponse)
-		// etcdserver need to ensure the raft has already been notified
-		// or advanced before it responds to the client. Otherwise, the
-		// following config change request may be rejected.
-		// See https://github.com/etcd-io/etcd/issues/15528.
-		<-resp.raftAdvanceC
 		lg.Info(
 			"applied a configuration change through raft",
 			zap.String("local-member-id", s.MemberId().String()),
@@ -1816,20 +1825,47 @@ func (s *EtcdServer) sendMergedSnap(merged snap.Message) {
 func (s *EtcdServer) apply(
 	es []raftpb.Entry,
 	confState *raftpb.ConfState,
-	raftAdvancedC <-chan struct{},
 ) (appliedt uint64, appliedi uint64, shouldStop bool) {
 	s.lg.Debug("Applying entries", zap.Int("num-entries", len(es)))
+
+	//@ethan
+	// lg := s.Logger()
+	// lg.Info("---------- Applying entries ----------", zap.Int("num-entries", len(es)))
+
 	for i := range es {
 		e := es[i]
+
+		//@ethan
+		// lg.Info("Applying entry",
+		// 	zap.Uint64("index", e.Index),
+		// 	zap.Uint64("term", e.Term),
+		// 	zap.Stringer("type", e.Type),
+		// 	zap.String("DATA", string(e.Data)))
+
 		s.lg.Debug("Applying entry",
 			zap.Uint64("index", e.Index),
 			zap.Uint64("term", e.Term),
 			zap.Stringer("type", e.Type))
 		switch e.Type {
 		case raftpb.EntryNormal:
+			//@ethan
+			// lg.Info("^^^^ Server applied index BEFORE applyEntryNormal ^^^^",
+			// 	zap.Uint64("applied index before", s.getAppliedIndex()))
+
 			s.applyEntryNormal(&e)
 			s.setAppliedIndex(e.Index)
 			s.setTerm(e.Term)
+
+			//@ethan passes data to go rountine that handles writing to Scrooge
+
+			s.WriteScroogeC <- e.Data
+
+			// lg.Info("---------- Data length ----------",
+			// 	zap.Int("e.data length", len(e.Data)))
+			// s.WriteScroogeC <- []byte("a")
+
+			// lg.Info("^^^^ Server applied index AFTER applyEntryNormal ^^^^",
+			// 	zap.Uint64("applied index after", s.getAppliedIndex()))
 
 		case raftpb.EntryConfChange:
 			// We need to toApply all WAL entries on top of v2store
@@ -1848,7 +1884,7 @@ func (s *EtcdServer) apply(
 			s.setAppliedIndex(e.Index)
 			s.setTerm(e.Term)
 			shouldStop = shouldStop || removedSelf
-			s.w.Trigger(cc.ID, &confChangeResponse{s.cluster.Members(), raftAdvancedC, err})
+			s.w.Trigger(cc.ID, &confChangeResponse{s.cluster.Members(), err})
 
 		default:
 			lg := s.Logger()
@@ -1912,6 +1948,8 @@ func (s *EtcdServer) applyEntryNormal(e *raftpb.Entry) {
 	if raftReq.V2 != nil {
 		req := (*RequestV2)(raftReq.V2)
 		s.w.Trigger(req.ID, s.applyV2Request(req, shouldApplyV3))
+
+		fmt.Println("Server finished applying V2Request!")
 		return
 	}
 
